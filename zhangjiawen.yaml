@@ -1,6 +1,0 @@
-# 规则名称: 大黑牛套餐自带免流以及放行域名
-domain_keyword_set:
-  - 189.cn
-  - signall
-  - sign.drnrt8.cn
-  - plist.nuosike.com
