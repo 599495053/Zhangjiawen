@@ -631,7 +631,7 @@ function progressBar(remainRatio, fill) {
         borderRadius: 5,
         width: fill ? undefined : Math.max(4, Math.round(180 * pct)),
         flex: fill ? pct : undefined,
-        children: [{ type: 'spacer' flex: 1 - pct }],
+        children: [{ type: 'spacer', flex: 1 - pct },],
       },
       { type: 'spacer' },
     ],
