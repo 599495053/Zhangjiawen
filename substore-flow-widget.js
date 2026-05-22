@@ -1,3 +1,33 @@
+/**
+ * Sub-Store 流量查询小组件
+ *
+ * 环境变量示例：
+ *
+ *   SUB_STORE_BASE_URL=http://192.168.1.100:3000   # Sub-Store 地址（优先级最高）
+ *   SUB_STORE_URL=http://sub.store                  # 备用 Sub-Store 地址
+ *   BASE_URL=http://sub.store                       # 备用 Sub-Store 地址
+ *
+ *   SUB_NAMES=机场A,机场B                            # 指定显示的订阅名称（逗号/换行/管道符分隔）
+ *                                                    # 不设置则显示全部订阅
+ *   MATCH_CONTAINS=true                             # 订阅名称模糊匹配（默认 false 精确匹配）
+ *
+ *   TITLE=我的套餐                                   # 小组件标题（默认 "Sub-Store 套餐"）
+ *   OPEN_URL=https://sub-store.vercel.app            # 点击小组件打开的地址
+ *   MAX_ITEMS=3                                      # 最多显示几个订阅（默认按小组件尺寸自动）
+ *   REFRESH_MINUTES=30                               # 刷新间隔分钟数（默认 30，最小 5）
+ *   TIMEOUT_MS=8000                                  # 请求超时毫秒数（默认 8000）
+ *   FLOW_USER_AGENT=clash.meta/v1.19.23              # 流量查询 User-Agent
+ *   INSECURE_TLS=false                               # 允许不安全的 HTTPS（默认 false）
+ *   USE_CACHE=true                                   # 启用缓存（默认 true）
+ *   HIDE_ERRORS=false                                # 隐藏错误订阅（默认 false）
+ *
+ *   RESET_DAY=1                                      # 每月几号重置流量（1-31）
+ *   START_DATE=2024-01-15                            # 周期重置起始日期
+ *   CYCLE_DAYS=30                                    # 周期重置天数
+ *   RESET_RULES={"机场A":{"resetDay":"5"}}            # 按订阅名单独设置重置规则
+ *
+ */
+
 export default async function (ctx) {
   const cfg = getConfig(ctx);
   const cache = readCache(ctx, cfg);
@@ -73,13 +103,10 @@ function getConfig(ctx) {
     startDate: env.START_DATE || '',
     cycleDays: env.CYCLE_DAYS || '',
     resetRules: parseResetRules(env.RESET_RULES || ''),
-    manualSubs: parseManualSubs(env.SUB_URLS || env.SUB_URL || ''),
   };
 }
 
 async function fetchSubscriptions(ctx, cfg) {
-  if (Array.isArray(cfg.manualSubs) && cfg.manualSubs.length) return cfg.manualSubs;
-
   const storedSubs = readStoredSubscriptions(ctx);
   if (storedSubs.length) return storedSubs;
 
@@ -105,22 +132,22 @@ async function fetchSubscriptions(ctx, cfg) {
 }
 
 function selectSubscriptions(subs, cfg) {
-  if (!cfg.names.length) return subs.filter(isLikelyFlowSub);
+  if (!cfg.names.length) return subs.filter(isRemoteSub);
   return cfg.names.map((name) => {
     const wanted = String(name).trim();
-    let found = subs.find((s) => String(s && s.name) === wanted);
+    let found = subs.find((s) => String(s?.name || '') === wanted);
     if (!found && cfg.matchContains) {
-      found = subs.find((s) => String(s && s.name || '').includes(wanted));
+      found = subs.find((s) => String(s?.name || '').includes(wanted));
     }
     return found || { name: wanted, missing: true };
   });
 }
 
-function isLikelyFlowSub(sub) {
+function isRemoteSub(sub) {
   if (!sub || typeof sub !== 'object') return false;
-  if (sub.manual) return true;
   if (sub.subUserinfo) return true;
-  if (sub.source === 'remote' && firstHttpUrl(sub.url || '')) return true;
+  if (sub.source === 'remote') return true;
+  if (sub.url && /^https?:\/\//i.test(String(sub.url).trim())) return true;
   return false;
 }
 
@@ -131,19 +158,6 @@ async function fetchFlowItem(ctx, cfg, sub) {
       name,
       error: '订阅不存在',
     };
-  }
-
-  if (sub.manual) {
-    try {
-      const directFlow = await fetchDirectFlow(ctx, cfg, sub);
-      if (hasUsableFlow(directFlow)) return decorateItem(sub, directFlow, cfg);
-      throw new Error('无可用流量信息');
-    } catch (e) {
-      return {
-        name,
-        error: shortError(e),
-      };
-    }
   }
 
   try {
@@ -326,9 +340,10 @@ function renderWidget(cfg, payload, stale, staleMsg) {
   }
 
   if (fam === 'systemSmall') {
-    children.push(renderSmallCard(shown[0], true));
+    children.push(renderSmallCard(shown[0]));
   } else {
-    for (const item of shown) children.push(renderCard(item, false));
+    const large = fam === 'systemLarge' || fam === 'systemExtraLarge';
+    for (const item of shown) children.push(renderCard(item, large));
   }
 
   children.push(footer(cfg, payload, stale, staleMsg));
@@ -391,7 +406,7 @@ function summaryCard(summary) {
   };
 }
 
-function renderCard(item, compact) {
+function renderCard(item, large) {
   if (!item) {
     return missingCard('未选择订阅');
   }
@@ -402,50 +417,46 @@ function renderCard(item, compact) {
   return {
     type: 'stack',
     direction: 'column',
-    gap: compact ? 4 : 6,
-    padding: compact ? [8, 10] : [9, 10],
+    gap: 6,
+    padding: [9, 10],
     backgroundColor: '#FFFFFF12',
     borderRadius: 12,
     children: [
+      text(displayName(item), large ? 'headline' : 'subheadline', 'semibold', '#FFFFFF', {
+        maxLines: 1,
+        minScale: 0.6,
+      }),
+      text(remainText(item), large ? 'title2' : 'title3', 'bold', colorForRemain(item.remainRatio), {
+        maxLines: 1,
+        minScale: 0.6,
+        textAlign: 'center',
+      }),
       {
         type: 'stack',
         direction: 'row',
         alignItems: 'center',
         gap: 6,
         children: [
-          text(displayName(item), compact ? 'caption1' : 'subheadline', 'semibold', '#FFFFFF', {
-            maxLines: 1,
-            minScale: 0.6,
-            flex: 1,
-          }),
-          text(remainText(item), compact ? 'headline' : 'title3', 'bold', colorForRemain(item.remainRatio), {
-            maxLines: 1,
-            minScale: 0.6,
-          }),
+          progressBar(item.remainRatio, true),
+          text(ratioText(item.remainRatio), large ? 'caption1' : 'caption2', 'semibold', '#CBD5E1', { maxLines: 1 }),
         ],
       },
-      {
-        type: 'stack',
-        direction: 'row',
-        alignItems: 'center',
-        gap: 7,
-        children: [
-          progressBar(item.remainRatio),
-          text(ratioText(item.remainRatio), 'caption2', 'semibold', '#CBD5E1', { maxLines: 1 }),
-        ],
-      },
-      text('重置 ' + resetText(item) + '  ·  到期 ' + expireText(item), 'caption2', 'regular', '#CBD5E1', {
+      text('总流量 ' + totalText(item) + '  ·  已用 ' + formatBytes(item.used), large ? 'caption1' : 'footnote', 'regular', '#CBD5E1', {
+        maxLines: 1,
+        minScale: 0.55,
+      }),
+      text('重置 ' + resetText(item) + '  ·  到期 ' + expireText(item), large ? 'caption1' : 'footnote', 'regular', '#CBD5E1', {
         maxLines: 1,
         minScale: 0.55,
       }),
       item.planName && item.planName !== item.name
-        ? text(item.planName, 'caption2', 'regular', '#94A3B8', { maxLines: 1, minScale: 0.55 })
+        ? text(item.planName, large ? 'caption1' : 'caption2', 'regular', '#94A3B8', { maxLines: 1, minScale: 0.55 })
         : { type: 'spacer', length: 0 },
     ],
   };
 }
 
-function renderSmallCard(item, compact) {
+function renderSmallCard(item) {
   if (!item) return missingCard('未选择订阅');
   if (item.error) return errorCard(item.name || '订阅', item.error);
   return {
@@ -456,11 +467,23 @@ function renderSmallCard(item, compact) {
     backgroundColor: '#FFFFFF12',
     borderRadius: 12,
     children: [
-      text(displayName(item), 'headline', 'bold', '#FFFFFF', { maxLines: 1, minScale: 0.6 }),
-      text(remainText(item), 'title2', 'bold', colorForRemain(item.remainRatio), { maxLines: 1, minScale: 0.6 }),
-      progressBar(item.remainRatio),
-      text('重置 ' + resetText(item), 'caption1', 'semibold', '#E5E7EB', { maxLines: 1, minScale: 0.55 }),
-      text('到期 ' + expireText(item), 'caption1', 'semibold', '#E5E7EB', { maxLines: 1, minScale: 0.55 }),
+      text(displayName(item), 'subheadline', 'semibold', '#FFFFFF', { maxLines: 1, minScale: 0.6 }),
+      text(remainText(item), 'title3', 'bold', colorForRemain(item.remainRatio), {
+        maxLines: 1,
+        minScale: 0.6,
+        textAlign: 'center',
+      }),
+      {
+        type: 'stack',
+        direction: 'row',
+        alignItems: 'center',
+        gap: 6,
+        children: [
+          progressBar(item.remainRatio, true),
+          text(ratioText(item.remainRatio), 'caption2', 'semibold', '#CBD5E1', { maxLines: 1 }),
+        ],
+      },
+      text('重置 ' + resetText(item) + '  ·  到期 ' + expireText(item), 'footnote', 'semibold', '#E5E7EB', { maxLines: 1, minScale: 0.55 }),
     ],
   };
 }
@@ -577,7 +600,7 @@ function errorCard(title, msg) {
   };
 }
 
-function progressBar(remainRatio) {
+function progressBar(remainRatio, fill) {
   if (!Number.isFinite(remainRatio)) {
     return {
       type: 'stack',
@@ -590,23 +613,24 @@ function progressBar(remainRatio) {
       ],
     };
   }
-  const width = 120;
-  const fill = Math.max(2, Math.round(width * clamp(remainRatio, 0, 1)));
+  const pct = clamp(remainRatio, 0, 1);
+  const barStyle = fill ? { flex: 1 } : { width: 180 };
   return {
     type: 'stack',
     direction: 'row',
     alignItems: 'center',
-    width,
-    height: 6,
+    height: 10,
     backgroundColor: '#FFFFFF20',
-    borderRadius: 3,
+    borderRadius: 5,
+    ...barStyle,
     children: [
       {
         type: 'stack',
-        width: fill,
-        height: 6,
+        height: 10,
         backgroundColor: colorForRemain(remainRatio),
-        borderRadius: 3,
+        borderRadius: 5,
+        width: fill ? undefined : Math.max(4, Math.round(180 * pct)),
+        flex: fill ? pct : undefined,
         children: [{ type: 'spacer' }],
       },
       { type: 'spacer' },
@@ -630,6 +654,11 @@ function remainText(item) {
   if (!item) return '--';
   if (!Number.isFinite(item.total) || item.total <= 0) return '无限流量';
   return '剩余 ' + formatBytes(item.remain);
+}
+
+function totalText(item) {
+  if (!item || !Number.isFinite(item.total) || item.total <= 0) return '无限';
+  return formatBytes(item.total);
 }
 
 function ratioText(remainRatio) {
@@ -663,19 +692,19 @@ function resetShort(item) {
 }
 
 function expireText(item) {
-  if (!item || !(item.expireAt instanceof Date) || isNaN(item.expireAt.getTime())) return '未知';
+  if (!item || !(item.expireAt instanceof Date) || isNaN(item.expireAt.getTime())) return '长期有效';
   return fmtDate(item.expireAt) + ' · ' + humanDuration(item.expireAt.getTime() - Date.now());
 }
 
 function expireShort(item) {
-  if (!item || !(item.expireAt instanceof Date) || isNaN(item.expireAt.getTime())) return '未知';
+  if (!item || !(item.expireAt instanceof Date) || isNaN(item.expireAt.getTime())) return '长期有效';
   return fmtMD(item.expireAt);
 }
 
 function colorForRemain(remainRatio) {
   if (!Number.isFinite(remainRatio)) return '#34D399';
-  if (remainRatio <= 0.1) return '#F87171';
-  if (remainRatio <= 0.25) return '#FBBF24';
+  if (remainRatio <= 0.3) return '#F87171';
+  if (remainRatio <= 0.5) return '#FBBF24';
   return '#34D399';
 }
 
@@ -929,7 +958,7 @@ function extractSubsFromValue(value) {
   if (!value) return [];
   if (Array.isArray(value)) {
     const arr = value.filter((item) => item && typeof item === 'object' && item.name);
-    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage', __apiFlowUrl: item.__apiFlowUrl || (item.name ? 'http://sub.store/api/sub/flow/' + encodeURIComponent(item.name) : '') }));
+    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage' }));
   }
   if (value && typeof value === 'object') {
     if (Array.isArray(value.subs)) return extractSubsFromValue(value.subs);
@@ -938,42 +967,9 @@ function extractSubsFromValue(value) {
     if (value['sub-store']) return extractSubsFromValue(value['sub-store']);
     const vals = Object.values(value);
     const arr = vals.filter((item) => item && typeof item === 'object' && item.name && (item.url || item.content || item.subUserinfo));
-    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage', __apiFlowUrl: item.__apiFlowUrl || (item.name ? 'http://sub.store/api/sub/flow/' + encodeURIComponent(item.name) : '') }));
+    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage' }));
   }
   return [];
-}
-
-function parseManualSubs(raw) {
-  const s = String(raw || '').trim();
-  if (!s) return [];
-  if (s[0] === '{' || s[0] === '[') {
-    try {
-      const parsed = JSON.parse(s);
-      if (Array.isArray(parsed)) {
-        return parsed.map((item, index) => {
-          if (typeof item === 'string') return { name: '订阅' + (index + 1), url: item, manual: true };
-          return { name: item.name || item.displayName || '订阅' + (index + 1), url: item.url || item.subUrl || '', subUserinfo: item.subUserinfo || '', manual: true };
-        }).filter((x) => x.url || x.subUserinfo);
-      }
-      if (parsed && typeof parsed === 'object') {
-        return Object.keys(parsed).map((name) => ({ name, url: parsed[name], manual: true })).filter((x) => x.url);
-      }
-    } catch (_) {}
-  }
-  return s.split(/[\n]+/).map((line, index) => {
-    line = line.trim();
-    if (!line) return null;
-    let name = '';
-    let url = line;
-    const sep = line.includes('=') ? '=' : line.includes('|') ? '|' : '';
-    if (sep) {
-      const i = line.indexOf(sep);
-      name = line.slice(0, i).trim();
-      url = line.slice(i + 1).trim();
-    }
-    if (!name) name = '订阅' + (index + 1);
-    return { name, url, manual: true };
-  }).filter((x) => x && x.url);
 }
 
 function parseResetRules(raw) {
@@ -1000,14 +996,6 @@ function parseResetRules(raw) {
     if (name && Object.keys(rule).length) rules[name] = rule;
   }
   return rules;
-}
-
-function firstNonEmpty() {
-  for (let i = 0; i < arguments.length; i += 1) {
-    const v = arguments[i];
-    if (v != null && String(v).trim() !== '') return v;
-  }
-  return '';
 }
 
 function bool(v, def) {
