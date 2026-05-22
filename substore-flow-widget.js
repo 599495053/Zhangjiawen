@@ -68,10 +68,17 @@ function getConfig(ctx) {
     insecureTls: bool(env.INSECURE_TLS, false),
     useCache: bool(env.USE_CACHE, true),
     cacheKey: env.CACHE_KEY || 'substore-flow-widget-cache-v2',
+    resetDay: env.RESET_DAY || '',
+    startDate: env.START_DATE || '',
+    cycleDays: env.CYCLE_DAYS || '',
+    resetRules: parseResetRules(env.RESET_RULES || ''),
+    manualSubs: parseManualSubs(env.SUB_URLS || env.SUB_URL || ''),
   };
 }
 
 async function fetchSubscriptions(ctx, cfg) {
+  if (Array.isArray(cfg.manualSubs) && cfg.manualSubs.length) return cfg.manualSubs;
+
   let lastError;
   const urls = Array.isArray(cfg.baseUrls) && cfg.baseUrls.length ? cfg.baseUrls : [cfg.baseUrl];
   for (const base of urls) {
@@ -114,6 +121,19 @@ async function fetchFlowItem(ctx, cfg, sub) {
     };
   }
 
+  if (sub.manual) {
+    try {
+      const directFlow = await fetchDirectFlow(ctx, cfg, sub);
+      if (hasUsableFlow(directFlow)) return decorateItem(sub, directFlow, cfg);
+      throw new Error('无可用流量信息');
+    } catch (e) {
+      return {
+        name,
+        error: shortError(e),
+      };
+    }
+  }
+
   try {
     const json = await requestJson(
       ctx,
@@ -122,11 +142,11 @@ async function fetchFlowItem(ctx, cfg, sub) {
     );
     const flow = normalizeFlow(unwrapData(json));
     if (!hasUsableFlow(flow)) throw new Error('无可用流量信息');
-    return decorateItem(sub, flow);
+    return decorateItem(sub, flow, cfg);
   } catch (e) {
     try {
       const directFlow = await fetchDirectFlow(ctx, cfg, sub);
-      if (hasUsableFlow(directFlow)) return decorateItem(sub, directFlow);
+      if (hasUsableFlow(directFlow)) return decorateItem(sub, directFlow, cfg);
     } catch (_) {}
     return {
       name,
@@ -175,7 +195,7 @@ async function fetchDirectFlow(ctx, cfg, sub) {
   throw new Error('响应头未包含流量信息');
 }
 
-function decorateItem(sub, flow) {
+function decorateItem(sub, flow, cfg) {
   const total = num(flow.total);
   const upload = finiteOrZero(flow.upload);
   const download = finiteOrZero(flow.download);
@@ -195,7 +215,7 @@ function decorateItem(sub, flow) {
     usedRatio,
     remainRatio,
     remainingDays: num(flow.remainingDays),
-    resetAt: calcResetAt(sub.url || '', flow.remainingDays),
+    resetAt: calcResetAt(sub.url || '', flow.remainingDays, sub.name, cfg),
     expireAt: Number.isFinite(flow.expires) && flow.expires > 0 ? new Date(flow.expires * 1000) : null,
     appUrl: flow.appUrl || '',
   };
@@ -636,9 +656,11 @@ function colorForRemain(remainRatio) {
   return '#34D399';
 }
 
-function calcResetAt(rawUrl, remainingDays) {
+function calcResetAt(rawUrl, remainingDays, subName, cfg) {
   const args = parseArgs(rawUrl);
   const now = new Date();
+  const envRule = getResetRule(subName, cfg);
+  Object.assign(args, envRule);
 
   if (args.startDate && args.cycleDays) {
     const cycle = parseInt(args.cycleDays, 10);
@@ -669,6 +691,17 @@ function calcResetAt(rawUrl, remainingDays) {
   }
 
   return null;
+}
+
+function getResetRule(subName, cfg) {
+  const rules = (cfg && cfg.resetRules) || {};
+  const name = String(subName || '');
+  if (rules[name]) return rules[name];
+  const fallback = {};
+  if (cfg && cfg.resetDay) fallback.resetDay = cfg.resetDay;
+  if (cfg && cfg.startDate) fallback.startDate = cfg.startDate;
+  if (cfg && cfg.cycleDays) fallback.cycleDays = cfg.cycleDays;
+  return fallback;
 }
 
 function parseArgs(rawUrl) {
@@ -799,6 +832,65 @@ function parseList(v) {
     } catch (_) {}
   }
   return s.split(/[\n,|]+/).map((x) => x.trim()).filter(Boolean);
+}
+
+function parseManualSubs(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return [];
+  if (s[0] === '{' || s[0] === '[') {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item, index) => {
+          if (typeof item === 'string') return { name: '订阅' + (index + 1), url: item, manual: true };
+          return { name: item.name || item.displayName || '订阅' + (index + 1), url: item.url || item.subUrl || '', subUserinfo: item.subUserinfo || '', manual: true };
+        }).filter((x) => x.url || x.subUserinfo);
+      }
+      if (parsed && typeof parsed === 'object') {
+        return Object.keys(parsed).map((name) => ({ name, url: parsed[name], manual: true })).filter((x) => x.url);
+      }
+    } catch (_) {}
+  }
+  return s.split(/[\n]+/).map((line, index) => {
+    line = line.trim();
+    if (!line) return null;
+    let name = '';
+    let url = line;
+    const sep = line.includes('=') ? '=' : line.includes('|') ? '|' : '';
+    if (sep) {
+      const i = line.indexOf(sep);
+      name = line.slice(0, i).trim();
+      url = line.slice(i + 1).trim();
+    }
+    if (!name) name = '订阅' + (index + 1);
+    return { name, url, manual: true };
+  }).filter((x) => x && x.url);
+}
+
+function parseResetRules(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return {};
+  try {
+    const obj = JSON.parse(s);
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+  } catch (_) {}
+  const rules = {};
+  for (const item of s.split(/[\n|]+/)) {
+    const line = item.trim();
+    if (!line) continue;
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    const name = line.slice(0, idx).trim();
+    const conf = line.slice(idx + 1).trim();
+    const rule = {};
+    for (const part of conf.split(/[,&]+/)) {
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      rule[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+    }
+    if (name && Object.keys(rule).length) rules[name] = rule;
+  }
+  return rules;
 }
 
 function firstNonEmpty() {
