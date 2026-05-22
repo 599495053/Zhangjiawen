@@ -43,19 +43,21 @@ function getConfig(ctx) {
     systemExtraLarge: 8,
   }[family] || 3;
 
-  const baseUrl = normalizeBaseUrl(
-    firstNonEmpty(
-      env.SUB_STORE_BASE_URL,
-      env.SUB_STORE_URL,
-      env.BASE_URL,
-      'http://sub.store',
-    ),
-  );
+  const baseUrls = unique([
+    env.SUB_STORE_BASE_URL,
+    env.SUB_STORE_URL,
+    env.BASE_URL,
+    'http://sub.store',
+    'https://sub.store',
+    'http://127.0.0.1:3000',
+    'http://localhost:3000',
+  ].map(normalizeBaseUrl).filter(Boolean));
 
   return {
     family,
     title: env.TITLE || 'Sub-Store 套餐',
-    baseUrl,
+    baseUrl: baseUrls[0] || 'http://sub.store',
+    baseUrls,
     openUrl: env.OPEN_URL || 'https://sub-store.vercel.app',
     names: parseList(env.SUB_NAMES || env.SUB_NAME || env.SUBS || ''),
     matchContains: bool(env.MATCH_CONTAINS, false),
@@ -70,11 +72,25 @@ function getConfig(ctx) {
 }
 
 async function fetchSubscriptions(ctx, cfg) {
-  const json = await requestJson(ctx, apiUrl(cfg.baseUrl, '/api/subs'), cfg);
-  const data = unwrapData(json);
-  if (Array.isArray(data)) return data.filter(Boolean);
-  if (data && typeof data === 'object') return Object.values(data).filter(Boolean);
-  throw new Error('订阅列表格式异常');
+  let lastError;
+  const urls = Array.isArray(cfg.baseUrls) && cfg.baseUrls.length ? cfg.baseUrls : [cfg.baseUrl];
+  for (const base of urls) {
+    try {
+      const json = await requestJson(ctx, apiUrl(base, '/api/subs'), cfg);
+      const data = unwrapData(json);
+      let subs = null;
+      if (Array.isArray(data)) subs = data.filter(Boolean);
+      else if (data && typeof data === 'object') subs = Object.values(data).filter(Boolean);
+      if (subs) {
+        cfg.baseUrl = base;
+        return subs;
+      }
+      throw new Error('订阅列表格式异常');
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError || new Error('无法连接 Sub-Store');
 }
 
 function selectSubscriptions(subs, cfg) {
@@ -726,6 +742,14 @@ function normalizeBaseUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '');
 }
 
+function unique(arr) {
+  const out = [];
+  for (const item of arr) {
+    if (item && !out.includes(item)) out.push(item);
+  }
+  return out;
+}
+
 function firstHttpUrl(raw) {
   const lines = String(raw || '').split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean);
   return lines.find((s) => /^https?:\/\//i.test(s)) || '';
@@ -885,7 +909,7 @@ function safeDecode(s) {
 
 function shortError(err) {
   const msg = err && err.message ? err.message : String(err || '未知错误');
-  if (/JSON 解析失败/.test(msg)) return '返回内容不是 JSON';
+  if (/JSON 解析失败/.test(msg)) return '不是 Sub-Store API：请检查 SUB_STORE_BASE_URL 或启用 Sub-Store 模块';
   if (/HTTP 401/.test(msg) || /HTTP 403/.test(msg)) return '接口拒绝访问';
   if (/HTTP 404/.test(msg)) return '接口不存在';
   if (/timeout|timed out/i.test(msg)) return '请求超时';
