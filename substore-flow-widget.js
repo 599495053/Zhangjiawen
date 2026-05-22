@@ -1,4 +1,4 @@
-/**
+/** 18.53
  * Sub-Store 流量查询小组件
  *
  * 环境变量示例：
@@ -631,9 +631,9 @@ function progressBar(remainRatio, fill) {
         borderRadius: 5,
         width: fill ? undefined : Math.max(4, Math.round(180 * pct)),
         flex: fill ? pct : undefined,
-        children: [{ type: 'spacer', flex: 1 - pct },],
+        children: [{ type: 'spacer' }],
       },
-      { type: 'spacer' },
+      { type: 'spacer', flex: 1 - pct },
     ],
   };
 }
