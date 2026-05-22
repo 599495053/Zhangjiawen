@@ -18,7 +18,7 @@ export default async function (ctx) {
     const payload = {
       at: Date.now(),
       source: cfg.baseUrl,
-      items,
+      items: cfg.hideErrors ? items.filter((item) => !item.error) : items,
     };
     writeCache(ctx, cfg, payload);
     return renderWidget(cfg, payload, false);
@@ -67,6 +67,7 @@ function getConfig(ctx) {
     flowUserAgent: env.FLOW_USER_AGENT || 'clash.meta/v1.19.23',
     insecureTls: bool(env.INSECURE_TLS, false),
     useCache: bool(env.USE_CACHE, true),
+    hideErrors: bool(env.HIDE_ERRORS, false),
     cacheKey: env.CACHE_KEY || 'substore-flow-widget-cache-v2',
     resetDay: env.RESET_DAY || '',
     startDate: env.START_DATE || '',
@@ -104,7 +105,7 @@ async function fetchSubscriptions(ctx, cfg) {
 }
 
 function selectSubscriptions(subs, cfg) {
-  if (!cfg.names.length) return subs;
+  if (!cfg.names.length) return subs.filter(isLikelyFlowSub);
   return cfg.names.map((name) => {
     const wanted = String(name).trim();
     let found = subs.find((s) => String(s && s.name) === wanted);
@@ -113,6 +114,14 @@ function selectSubscriptions(subs, cfg) {
     }
     return found || { name: wanted, missing: true };
   });
+}
+
+function isLikelyFlowSub(sub) {
+  if (!sub || typeof sub !== 'object') return false;
+  if (sub.manual) return true;
+  if (sub.subUserinfo) return true;
+  if (sub.source === 'remote' && firstHttpUrl(sub.url || '')) return true;
+  return false;
 }
 
 async function fetchFlowItem(ctx, cfg, sub) {
@@ -138,6 +147,17 @@ async function fetchFlowItem(ctx, cfg, sub) {
   }
 
   try {
+    const storedFlow = readStoredFlow(ctx, name);
+    if (storedFlow) return decorateItem(sub, storedFlow, cfg);
+
+    if (sub.__apiFlowUrl) {
+      try {
+        const json = await requestJson(ctx, sub.__apiFlowUrl, cfg);
+        const flow = normalizeFlow(unwrapData(json));
+        if (hasUsableFlow(flow)) return decorateItem(sub, flow, cfg);
+      } catch (_) {}
+    }
+
     const json = await requestJson(
       ctx,
       apiUrl(cfg.baseUrl, '/api/sub/flow/' + encodeURIComponent(name)),
@@ -867,6 +887,34 @@ function readStoredSubscriptions(ctx) {
   return [];
 }
 
+function readStoredFlow(ctx, name) {
+  const storage = ctx && ctx.storage;
+  if (!storage) return null;
+  const keys = [
+    'flow:' + name,
+    'flow_' + name,
+    'sub-flow:' + name,
+    'sub_flow_' + name,
+    'substore-flow:' + name,
+    'substore_flow_' + name,
+  ];
+  for (const key of keys) {
+    try {
+      if (typeof storage.getJSON === 'function') {
+        const flow = normalizeFlow(storage.getJSON(key));
+        if (hasUsableFlow(flow)) return flow;
+      }
+    } catch (_) {}
+    try {
+      if (typeof storage.get === 'function') {
+        const flow = normalizeFlow(parseMaybeJSON(storage.get(key)));
+        if (hasUsableFlow(flow)) return flow;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 function parseMaybeJSON(value) {
   if (!value) return null;
   if (typeof value !== 'string') return value;
@@ -881,7 +929,7 @@ function extractSubsFromValue(value) {
   if (!value) return [];
   if (Array.isArray(value)) {
     const arr = value.filter((item) => item && typeof item === 'object' && item.name);
-    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage' }));
+    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage', __apiFlowUrl: item.__apiFlowUrl || (item.name ? 'http://sub.store/api/sub/flow/' + encodeURIComponent(item.name) : '') }));
   }
   if (value && typeof value === 'object') {
     if (Array.isArray(value.subs)) return extractSubsFromValue(value.subs);
@@ -890,7 +938,7 @@ function extractSubsFromValue(value) {
     if (value['sub-store']) return extractSubsFromValue(value['sub-store']);
     const vals = Object.values(value);
     const arr = vals.filter((item) => item && typeof item === 'object' && item.name && (item.url || item.content || item.subUserinfo));
-    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage' }));
+    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage', __apiFlowUrl: item.__apiFlowUrl || (item.name ? 'http://sub.store/api/sub/flow/' + encodeURIComponent(item.name) : '') }));
   }
   return [];
 }
