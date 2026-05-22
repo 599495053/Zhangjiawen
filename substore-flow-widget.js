@@ -79,6 +79,9 @@ function getConfig(ctx) {
 async function fetchSubscriptions(ctx, cfg) {
   if (Array.isArray(cfg.manualSubs) && cfg.manualSubs.length) return cfg.manualSubs;
 
+  const storedSubs = readStoredSubscriptions(ctx);
+  if (storedSubs.length) return storedSubs;
+
   let lastError;
   const urls = Array.isArray(cfg.baseUrls) && cfg.baseUrls.length ? cfg.baseUrls : [cfg.baseUrl];
   for (const base of urls) {
@@ -832,6 +835,64 @@ function parseList(v) {
     } catch (_) {}
   }
   return s.split(/[\n,|]+/).map((x) => x.trim()).filter(Boolean);
+}
+
+function readStoredSubscriptions(ctx) {
+  const storage = ctx && ctx.storage;
+  if (!storage) return [];
+
+  const candidates = [];
+  const keys = [
+    'subs',
+    'sub-store',
+    'Sub-Store',
+    'substore',
+    'SubStore',
+    'subscriptions',
+  ];
+
+  for (const key of keys) {
+    try {
+      if (typeof storage.getJSON === 'function') candidates.push(storage.getJSON(key));
+    } catch (_) {}
+    try {
+      if (typeof storage.get === 'function') candidates.push(parseMaybeJSON(storage.get(key)));
+    } catch (_) {}
+  }
+
+  for (const value of candidates) {
+    const subs = extractSubsFromValue(value);
+    if (subs.length) return subs;
+  }
+  return [];
+}
+
+function parseMaybeJSON(value) {
+  if (!value) return null;
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function extractSubsFromValue(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    const arr = value.filter((item) => item && typeof item === 'object' && item.name);
+    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage' }));
+  }
+  if (value && typeof value === 'object') {
+    if (Array.isArray(value.subs)) return extractSubsFromValue(value.subs);
+    if (value.data) return extractSubsFromValue(value.data);
+    if (value.cache) return extractSubsFromValue(value.cache);
+    if (value['sub-store']) return extractSubsFromValue(value['sub-store']);
+    const vals = Object.values(value);
+    const arr = vals.filter((item) => item && typeof item === 'object' && item.name && (item.url || item.content || item.subUserinfo));
+    if (arr.length) return arr.map((item) => ({ ...item, source: item.source || 'storage' }));
+  }
+  return [];
 }
 
 function parseManualSubs(raw) {
