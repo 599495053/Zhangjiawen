@@ -1,0 +1,929 @@
+export default async function (ctx) {
+  const cfg = getConfig(ctx);
+  const cache = readCache(ctx, cfg);
+
+  try {
+    const subs = await fetchSubscriptions(ctx, cfg);
+    const selected = selectSubscriptions(subs, cfg);
+    if (!selected.length) {
+      return errorWidget(cfg, '未找到订阅', 'SUB_NAMES 没有匹配到 Sub-Store 里的订阅名称');
+    }
+
+    const items = [];
+    const selectedItems = selected.slice(0, cfg.maxItems);
+    await Promise.all(selectedItems.map(async (sub, index) => {
+      items[index] = await fetchFlowItem(ctx, cfg, sub);
+    }));
+
+    const payload = {
+      at: Date.now(),
+      source: cfg.baseUrl,
+      items,
+    };
+    writeCache(ctx, cfg, payload);
+    return renderWidget(cfg, payload, false);
+  } catch (e) {
+    if (cache && Array.isArray(cache.items) && cache.items.length) {
+      return renderWidget(cfg, cache, true, shortError(e));
+    }
+    return errorWidget(cfg, 'Sub-Store 连接失败', shortError(e));
+  }
+}
+
+function getConfig(ctx) {
+  const env = ctx.env || {};
+  const family = ctx.widgetFamily || 'systemMedium';
+  const defaultMax = {
+    accessoryInline: 1,
+    accessoryCircular: 1,
+    accessoryRectangular: 1,
+    systemSmall: 1,
+    systemMedium: 3,
+    systemLarge: 6,
+    systemExtraLarge: 8,
+  }[family] || 3;
+
+  const baseUrl = normalizeBaseUrl(
+    firstNonEmpty(
+      env.SUB_STORE_BASE_URL,
+      env.SUB_STORE_URL,
+      env.BASE_URL,
+      'http://sub.store',
+    ),
+  );
+
+  return {
+    family,
+    title: env.TITLE || 'Sub-Store 套餐',
+    baseUrl,
+    openUrl: env.OPEN_URL || 'https://sub-store.vercel.app',
+    names: parseList(env.SUB_NAMES || env.SUB_NAME || env.SUBS || ''),
+    matchContains: bool(env.MATCH_CONTAINS, false),
+    maxItems: clampInt(env.MAX_ITEMS, defaultMax, 1, 12),
+    refreshMinutes: clampInt(env.REFRESH_MINUTES, 30, 5, 1440),
+    timeout: clampInt(env.TIMEOUT_MS || env.TIMEOUT, 8000, 1000, 60000),
+    flowUserAgent: env.FLOW_USER_AGENT || 'clash.meta/v1.19.23',
+    insecureTls: bool(env.INSECURE_TLS, false),
+    useCache: bool(env.USE_CACHE, true),
+    cacheKey: env.CACHE_KEY || 'substore-flow-widget-cache-v2',
+  };
+}
+
+async function fetchSubscriptions(ctx, cfg) {
+  const json = await requestJson(ctx, apiUrl(cfg.baseUrl, '/api/subs'), cfg);
+  const data = unwrapData(json);
+  if (Array.isArray(data)) return data.filter(Boolean);
+  if (data && typeof data === 'object') return Object.values(data).filter(Boolean);
+  throw new Error('订阅列表格式异常');
+}
+
+function selectSubscriptions(subs, cfg) {
+  if (!cfg.names.length) return subs;
+  return cfg.names.map((name) => {
+    const wanted = String(name).trim();
+    let found = subs.find((s) => String(s && s.name) === wanted);
+    if (!found && cfg.matchContains) {
+      found = subs.find((s) => String(s && s.name || '').includes(wanted));
+    }
+    return found || { name: wanted, missing: true };
+  });
+}
+
+async function fetchFlowItem(ctx, cfg, sub) {
+  const name = String(sub && sub.name ? sub.name : '未命名订阅');
+  if (sub.missing) {
+    return {
+      name,
+      error: '订阅不存在',
+    };
+  }
+
+  try {
+    const json = await requestJson(
+      ctx,
+      apiUrl(cfg.baseUrl, '/api/sub/flow/' + encodeURIComponent(name)),
+      cfg,
+    );
+    const flow = normalizeFlow(unwrapData(json));
+    if (!hasUsableFlow(flow)) throw new Error('无可用流量信息');
+    return decorateItem(sub, flow);
+  } catch (e) {
+    try {
+      const directFlow = await fetchDirectFlow(ctx, cfg, sub);
+      if (hasUsableFlow(directFlow)) return decorateItem(sub, directFlow);
+    } catch (_) {}
+    return {
+      name,
+      error: shortError(e),
+    };
+  }
+}
+
+async function fetchDirectFlow(ctx, cfg, sub) {
+  const raw = firstHttpUrl(sub.url || sub.subUserinfo || '');
+  if (!raw) throw new Error('订阅链接不可用');
+  const parts = splitUrlArgs(raw);
+  const args = parts.args;
+  if (args.noFlow) throw new Error('noFlow');
+
+  const url = args.flowUrl || parts.url;
+  const headers = {
+    'User-Agent': args.flowUserAgent || cfg.flowUserAgent,
+  };
+  Object.assign(headers, parseHeaderObject(args.flowHeaders || args.headers));
+
+  const opt = {
+    headers,
+    timeout: cfg.timeout,
+    redirect: 'follow',
+    insecureTls: cfg.insecureTls || !!args.insecure,
+  };
+
+  if (args.flowUrl) {
+    const resp = await ctx.http.get(url, opt);
+    const bodyFlow = parseFlowString(await safeText(resp));
+    if (hasUsableFlow(bodyFlow)) return bodyFlow;
+    const headerFlow = parseFlowHeaders(resp.headers);
+    if (hasUsableFlow(headerFlow)) return headerFlow;
+  }
+
+  try {
+    const resp = await ctx.http.head(url, opt);
+    const flow = parseFlowHeaders(resp.headers);
+    if (hasUsableFlow(flow)) return flow;
+  } catch (_) {}
+
+  const resp = await ctx.http.get(url, opt);
+  const flow = parseFlowHeaders(resp.headers);
+  if (hasUsableFlow(flow)) return flow;
+  throw new Error('响应头未包含流量信息');
+}
+
+function decorateItem(sub, flow) {
+  const total = num(flow.total);
+  const upload = finiteOrZero(flow.upload);
+  const download = finiteOrZero(flow.download);
+  const used = upload + download;
+  const remain = Number.isFinite(total) && total > 0 ? Math.max(0, total - used) : NaN;
+  const usedRatio = Number.isFinite(total) && total > 0 ? clamp(used / total, 0, 1) : NaN;
+  const remainRatio = Number.isFinite(usedRatio) ? 1 - usedRatio : NaN;
+
+  return {
+    name: String(sub.name || '订阅'),
+    planName: flow.planName || '',
+    total,
+    upload,
+    download,
+    used,
+    remain,
+    usedRatio,
+    remainRatio,
+    remainingDays: num(flow.remainingDays),
+    resetAt: calcResetAt(sub.url || '', flow.remainingDays),
+    expireAt: Number.isFinite(flow.expires) && flow.expires > 0 ? new Date(flow.expires * 1000) : null,
+    appUrl: flow.appUrl || '',
+  };
+}
+
+function normalizeFlow(raw) {
+  const data = raw && typeof raw === 'object' ? raw : {};
+  const usage = data.usage && typeof data.usage === 'object' ? data.usage : {};
+  return {
+    total: num(data.total),
+    upload: num(usage.upload ?? data.upload),
+    download: num(usage.download ?? data.download),
+    expires: num(data.expires ?? data.expire),
+    remainingDays: num(data.remainingDays ?? data.reset_day),
+    planName: String(data.planName || data.plan_name || ''),
+    appUrl: String(data.appUrl || data.app_url || ''),
+  };
+}
+
+function hasUsableFlow(flow) {
+  return flow && Number.isFinite(flow.total) && flow.total > 0 && Number.isFinite(flow.upload) && Number.isFinite(flow.download);
+}
+
+function parseFlowHeaders(headers) {
+  if (!headers) return {};
+  const subInfo = getHeaderValue(headers, 'subscription-userinfo');
+  const appUrl = getHeaderValue(headers, 'profile-web-page-url');
+  const planName = getHeaderValue(headers, 'plan-name');
+  const flow = parseFlowString(subInfo);
+  if (appUrl) flow.appUrl = appUrl;
+  if (planName) flow.planName = planName;
+  return flow;
+}
+
+function parseFlowString(raw) {
+  const s = String(raw || '');
+  const field = (key) => {
+    const m = s.match(new RegExp(key + '=([-+]?)([0-9]*\\.?[0-9]+(?:[eE][-+]?[0-9]+)?)'));
+    return m ? Number(m[1] + m[2]) : NaN;
+  };
+  const strField = (key) => {
+    const m = s.match(new RegExp(key + '=(.*?)\\s*?(;|$)'));
+    if (!m) return '';
+    return safeDecode(m[1]);
+  };
+  return normalizeFlow({
+    upload: field('upload'),
+    download: field('download'),
+    total: field('total'),
+    expire: field('expire'),
+    reset_day: field('reset_day'),
+    app_url: strField('app_url'),
+    plan_name: strField('plan_name'),
+  });
+}
+
+function renderWidget(cfg, payload, stale, staleMsg) {
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const fam = cfg.family;
+
+  if (fam === 'accessoryInline') {
+    return {
+      type: 'widget',
+      refreshAfter: refreshISO(cfg.refreshMinutes),
+      url: cfg.openUrl,
+      children: [renderInline(cfg, items[0], stale)],
+    };
+  }
+
+  if (fam === 'accessoryCircular') {
+    return root(cfg, [renderCircular(items[0], stale, cfg)], stale);
+  }
+
+  if (fam === 'accessoryRectangular') {
+    return root(cfg, [renderAccessoryRectangular(cfg, items[0], stale)], stale);
+  }
+
+  const limit = fam === 'systemLarge' || fam === 'systemExtraLarge' ? 6 : fam === 'systemSmall' ? 1 : 3;
+  const shown = items.slice(0, limit);
+  const children = [header(cfg, payload, stale)];
+
+  if (shown.length > 1) {
+    const summary = aggregate(shown);
+    if (summary) children.push(summaryCard(summary));
+  }
+
+  if (fam === 'systemSmall') {
+    children.push(renderSmallCard(shown[0], true));
+  } else {
+    for (const item of shown) children.push(renderCard(item, false));
+  }
+
+  children.push(footer(cfg, payload, stale, staleMsg));
+  return root(cfg, children, stale);
+}
+
+function root(cfg, children, stale) {
+  return {
+    type: 'widget',
+    url: cfg.openUrl,
+    refreshAfter: refreshISO(cfg.refreshMinutes),
+    padding: 14,
+    gap: 8,
+    backgroundGradient: {
+      type: 'linear',
+      colors: stale ? ['#2b1b0f', '#1f2937'] : ['#0f172a', '#111827', '#1e293b'],
+      startPoint: { x: 0, y: 0 },
+      endPoint: { x: 1, y: 1 },
+    },
+    children,
+  };
+}
+
+function header(cfg, payload, stale) {
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 6,
+    children: [
+      {
+        type: 'image',
+        src: stale ? 'sf-symbol:exclamationmark.triangle.fill' : 'sf-symbol:chart.bar.xaxis',
+        color: stale ? '#F59E0B' : '#60A5FA',
+        width: 16,
+        height: 16,
+      },
+      text(stale ? cfg.title + ' · 缓存' : cfg.title, 'caption1', 'semibold', '#E5E7EB', { maxLines: 1, minScale: 0.6 }),
+      { type: 'spacer' },
+      text(fmtClock(payload.at || Date.now()), 'caption2', 'regular', '#94A3B8', { maxLines: 1 }),
+    ],
+  };
+}
+
+function summaryCard(summary) {
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 8,
+    padding: [8, 10],
+    backgroundColor: '#0EA5E920',
+    borderRadius: 12,
+    children: [
+      { type: 'image', src: 'sf-symbol:sum', color: '#BAE6FD', width: 16, height: 16 },
+      text('合计剩余', 'caption1', 'semibold', '#E0F2FE'),
+      { type: 'spacer' },
+      text(summary.text, 'headline', 'bold', summary.color, { maxLines: 1, minScale: 0.7 }),
+    ],
+  };
+}
+
+function renderCard(item, compact) {
+  if (!item) {
+    return missingCard('未选择订阅');
+  }
+  if (item.error) {
+    return errorCard(item.name || '订阅', item.error);
+  }
+
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: compact ? 4 : 6,
+    padding: compact ? [8, 10] : [9, 10],
+    backgroundColor: '#FFFFFF12',
+    borderRadius: 12,
+    children: [
+      {
+        type: 'stack',
+        direction: 'row',
+        alignItems: 'center',
+        gap: 6,
+        children: [
+          text(displayName(item), compact ? 'caption1' : 'subheadline', 'semibold', '#FFFFFF', {
+            maxLines: 1,
+            minScale: 0.6,
+            flex: 1,
+          }),
+          text(remainText(item), compact ? 'headline' : 'title3', 'bold', colorForRemain(item.remainRatio), {
+            maxLines: 1,
+            minScale: 0.6,
+          }),
+        ],
+      },
+      {
+        type: 'stack',
+        direction: 'row',
+        alignItems: 'center',
+        gap: 7,
+        children: [
+          progressBar(item.remainRatio),
+          text(ratioText(item.remainRatio), 'caption2', 'semibold', '#CBD5E1', { maxLines: 1 }),
+        ],
+      },
+      text('重置 ' + resetText(item) + '  ·  到期 ' + expireText(item), 'caption2', 'regular', '#CBD5E1', {
+        maxLines: 1,
+        minScale: 0.55,
+      }),
+      item.planName && item.planName !== item.name
+        ? text(item.planName, 'caption2', 'regular', '#94A3B8', { maxLines: 1, minScale: 0.55 })
+        : { type: 'spacer', length: 0 },
+    ],
+  };
+}
+
+function renderSmallCard(item, compact) {
+  if (!item) return missingCard('未选择订阅');
+  if (item.error) return errorCard(item.name || '订阅', item.error);
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: 6,
+    padding: [8, 10],
+    backgroundColor: '#FFFFFF12',
+    borderRadius: 12,
+    children: [
+      text(displayName(item), 'headline', 'bold', '#FFFFFF', { maxLines: 1, minScale: 0.6 }),
+      text(remainText(item), 'title2', 'bold', colorForRemain(item.remainRatio), { maxLines: 1, minScale: 0.6 }),
+      progressBar(item.remainRatio),
+      text('重置 ' + resetText(item), 'caption1', 'semibold', '#E5E7EB', { maxLines: 1, minScale: 0.55 }),
+      text('到期 ' + expireText(item), 'caption1', 'semibold', '#E5E7EB', { maxLines: 1, minScale: 0.55 }),
+    ],
+  };
+}
+
+function renderInline(cfg, item, stale) {
+  if (!item) return text('未选择订阅', 'caption1', 'semibold', '#FFFFFF', { maxLines: 1, minScale: 0.5 });
+  if (item.error) return text(displayName(item) + ' · ' + item.error, 'caption1', 'semibold', '#FCA5A5', { maxLines: 1, minScale: 0.5 });
+  const body = displayName(item) + ' 剩余 ' + remainText(item) + ' · 重置 ' + resetShort(item) + ' · 到期 ' + expireShort(item);
+  return text(body, 'caption1', 'semibold', stale ? '#FDE68A' : '#FFFFFF', { maxLines: 1, minScale: 0.45 });
+}
+
+function renderCircular(item, stale, cfg) {
+  const pct = Number.isFinite(item && item.remainRatio) ? Math.round(item.remainRatio * 100) + '%' : '--';
+  return {
+    type: 'widget',
+    url: cfg.openUrl,
+    refreshAfter: refreshISO(cfg.refreshMinutes),
+    padding: 4,
+    gap: 2,
+    backgroundColor: 'rgba(0,0,0,0)',
+    children: [
+      { type: 'image', src: 'sf-symbol:chart.pie.fill', color: stale ? '#F59E0B' : colorForRemain(item && item.remainRatio), width: 18, height: 18 },
+      text(pct, 'headline', 'bold', '#FFFFFF', { textAlign: 'center', maxLines: 1, minScale: 0.6 }),
+    ],
+  };
+}
+
+function renderAccessoryRectangular(cfg, item, stale) {
+  if (!item) return missingCard('未选择订阅');
+  if (item.error) return errorCard(item.name || '订阅', item.error);
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: 2,
+    padding: 8,
+    backgroundColor: '#FFFFFF10',
+    borderRadius: 12,
+    children: [
+      text(displayName(item), 'caption1', 'semibold', '#FFFFFF', { maxLines: 1, minScale: 0.55 }),
+      text(remainText(item), 'headline', 'bold', colorForRemain(item.remainRatio), { maxLines: 1, minScale: 0.6 }),
+      text('重置 ' + resetShort(item) + ' · 到期 ' + expireShort(item), 'caption2', 'regular', '#CBD5E1', {
+        maxLines: 1,
+        minScale: 0.5,
+      }),
+    ],
+  };
+}
+
+function footer(cfg, payload, stale, staleMsg) {
+  const source = payload.source || cfg.baseUrl;
+  const msg = stale ? '缓存模式 · ' + (staleMsg || '最新请求失败') : '数据源 ' + source;
+  return text(msg, 'caption2', 'regular', stale ? '#FDE68A' : '#94A3B8', {
+    maxLines: 1,
+    minScale: 0.55,
+  });
+}
+
+function errorWidget(cfg, title, msg) {
+  return {
+    type: 'widget',
+    url: cfg.openUrl,
+    refreshAfter: refreshISO(cfg.refreshMinutes),
+    padding: 14,
+    gap: 8,
+    backgroundGradient: {
+      type: 'linear',
+      colors: ['#3f1d1d', '#1f2937'],
+      startPoint: { x: 0, y: 0 },
+      endPoint: { x: 1, y: 1 },
+    },
+    children: [
+      {
+        type: 'stack',
+        direction: 'row',
+        alignItems: 'center',
+        gap: 6,
+        children: [
+          { type: 'image', src: 'sf-symbol:exclamationmark.triangle.fill', color: '#FCA5A5', width: 16, height: 16 },
+          text(title, 'headline', 'bold', '#FFFFFF', { maxLines: 1 }),
+        ],
+      },
+      text(msg, 'caption1', 'regular', '#FCA5A5', { maxLines: 5, minScale: 0.65 }),
+    ],
+  };
+}
+
+function missingCard(msg) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: 4,
+    padding: [8, 10],
+    backgroundColor: '#FFFFFF12',
+    borderRadius: 12,
+    children: [
+      text('提示', 'caption1', 'semibold', '#FFFFFF', { maxLines: 1 }),
+      text(msg, 'caption2', 'regular', '#CBD5E1', { maxLines: 2, minScale: 0.65 }),
+    ],
+  };
+}
+
+function errorCard(title, msg) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    gap: 4,
+    padding: [8, 10],
+    backgroundColor: '#7F1D1D55',
+    borderRadius: 12,
+    children: [
+      text(title, 'caption1', 'semibold', '#FFFFFF', { maxLines: 1 }),
+      text(msg, 'caption2', 'regular', '#FCA5A5', { maxLines: 2, minScale: 0.65 }),
+    ],
+  };
+}
+
+function progressBar(remainRatio) {
+  if (!Number.isFinite(remainRatio)) {
+    return {
+      type: 'stack',
+      direction: 'row',
+      alignItems: 'center',
+      gap: 4,
+      children: [
+        { type: 'image', src: 'sf-symbol:infinity', color: '#34D399', width: 12, height: 12 },
+        text('无限流量', 'caption2', 'semibold', '#34D399', { maxLines: 1 }),
+      ],
+    };
+  }
+  const width = 120;
+  const fill = Math.max(2, Math.round(width * clamp(remainRatio, 0, 1)));
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    width,
+    height: 6,
+    backgroundColor: '#FFFFFF20',
+    borderRadius: 3,
+    children: [
+      {
+        type: 'stack',
+        width: fill,
+        height: 6,
+        backgroundColor: colorForRemain(remainRatio),
+        borderRadius: 3,
+        children: [{ type: 'spacer' }],
+      },
+      { type: 'spacer' },
+    ],
+  };
+}
+
+function aggregate(items) {
+  const finite = items.filter((i) => i && Number.isFinite(i.total) && i.total > 0 && Number.isFinite(i.remain));
+  if (!finite.length) return null;
+  const remain = finite.reduce((sum, i) => sum + i.remain, 0);
+  const total = finite.reduce((sum, i) => sum + i.total, 0);
+  const ratio = total > 0 ? remain / total : NaN;
+  return {
+    text: remainText({ remain, total }),
+    color: colorForRemain(ratio),
+  };
+}
+
+function remainText(item) {
+  if (!item) return '--';
+  if (!Number.isFinite(item.total) || item.total <= 0) return '无限流量';
+  return '剩余 ' + formatBytes(item.remain);
+}
+
+function ratioText(remainRatio) {
+  if (!Number.isFinite(remainRatio)) return '无限';
+  return Math.round(clamp(remainRatio, 0, 1) * 100) + '%';
+}
+
+function displayName(item) {
+  if (!item) return '订阅';
+  if (item.planName && item.planName !== item.name) return item.planName + ' · ' + item.name;
+  return item.planName || item.name || '订阅';
+}
+
+function resetText(item) {
+  if (!item) return '未知';
+  if (item.resetAt instanceof Date && !isNaN(item.resetAt.getTime())) {
+    return fmtDate(item.resetAt) + ' · ' + humanDuration(item.resetAt.getTime() - Date.now());
+  }
+  if (Number.isFinite(item.remainingDays)) {
+    const d = Math.max(0, Math.floor(item.remainingDays));
+    return (d === 0 ? '今天' : d + '天后');
+  }
+  return '未知';
+}
+
+function resetShort(item) {
+  if (!item) return '未知';
+  if (item.resetAt instanceof Date && !isNaN(item.resetAt.getTime())) return fmtMD(item.resetAt);
+  if (Number.isFinite(item.remainingDays)) return Math.max(0, Math.floor(item.remainingDays)) + '天';
+  return '未知';
+}
+
+function expireText(item) {
+  if (!item || !(item.expireAt instanceof Date) || isNaN(item.expireAt.getTime())) return '未知';
+  return fmtDate(item.expireAt) + ' · ' + humanDuration(item.expireAt.getTime() - Date.now());
+}
+
+function expireShort(item) {
+  if (!item || !(item.expireAt instanceof Date) || isNaN(item.expireAt.getTime())) return '未知';
+  return fmtMD(item.expireAt);
+}
+
+function colorForRemain(remainRatio) {
+  if (!Number.isFinite(remainRatio)) return '#34D399';
+  if (remainRatio <= 0.1) return '#F87171';
+  if (remainRatio <= 0.25) return '#FBBF24';
+  return '#34D399';
+}
+
+function calcResetAt(rawUrl, remainingDays) {
+  const args = parseArgs(rawUrl);
+  const now = new Date();
+
+  if (args.startDate && args.cycleDays) {
+    const cycle = parseInt(args.cycleDays, 10);
+    const start = new Date(args.startDate);
+    if (Number.isFinite(cycle) && cycle > 0 && !isNaN(start.getTime())) {
+      const today = startOfDay(now);
+      let next = startOfDay(start);
+      while (next <= today) next = addDays(next, cycle);
+      return next;
+    }
+  }
+
+  if (args.resetDay) {
+    const day = clampInt(args.resetDay, 1, 1, 31);
+    if (Number.isFinite(day)) {
+      const y = now.getFullYear();
+      const m = now.getMonth();
+      const thisDay = Math.min(day, daysInMonth(y, m));
+      if (now.getDate() <= thisDay) return new Date(y, m, thisDay, 0, 0, 0, 0);
+      const nextMonth = new Date(y, m + 1, 1, 0, 0, 0, 0);
+      nextMonth.setDate(Math.min(day, daysInMonth(nextMonth.getFullYear(), nextMonth.getMonth())));
+      return nextMonth;
+    }
+  }
+
+  if (Number.isFinite(remainingDays)) {
+    return addDays(startOfDay(now), Math.max(0, Math.floor(remainingDays)));
+  }
+
+  return null;
+}
+
+function parseArgs(rawUrl) {
+  const url = String(rawUrl || '').split(/\r?\n/).map((s) => s.trim()).find(Boolean) || '';
+  const idx = url.indexOf('#');
+  if (idx < 0) return {};
+  const frag = url.slice(idx + 1).trim();
+  if (!frag) return {};
+
+  try {
+    const obj = JSON.parse(safeDecode(frag));
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) return obj;
+  } catch (_) {}
+
+  const out = {};
+  for (const part of frag.split('&')) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    const key = eq < 0 ? part : part.slice(0, eq);
+    const val = eq < 0 ? '' : part.slice(eq + 1);
+    out[key] = val === '' ? true : safeDecode(val);
+  }
+  return out;
+}
+
+function requestJson(ctx, url, cfg) {
+  return ctx.http
+    .get(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'Egern-SubStore-Widget',
+      },
+      timeout: cfg.timeout,
+      redirect: 'follow',
+      insecureTls: cfg.insecureTls,
+    })
+    .then(async (resp) => {
+      const text = await safeText(resp);
+      if (resp.status < 200 || resp.status >= 300) {
+        throw new Error('HTTP ' + resp.status + ' ' + preview(text, 120));
+      }
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        throw new Error('JSON 解析失败 ' + preview(text, 120));
+      }
+    });
+}
+
+function unwrapData(json) {
+  if (json && typeof json === 'object' && 'data' in json) return json.data;
+  return json;
+}
+
+async function safeText(resp) {
+  try {
+    return await resp.text();
+  } catch (_) {
+    return '';
+  }
+}
+
+function apiUrl(base, path) {
+  const b = normalizeBaseUrl(base);
+  const p = String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || '');
+  if (/\/api$/i.test(b) && p.startsWith('/api/')) return b + p.slice(4);
+  return b + p;
+}
+
+function normalizeBaseUrl(url) {
+  return String(url || '').trim().replace(/\/+$/, '');
+}
+
+function firstHttpUrl(raw) {
+  const lines = String(raw || '').split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean);
+  return lines.find((s) => /^https?:\/\//i.test(s)) || '';
+}
+
+function splitUrlArgs(raw) {
+  const s = String(raw || '');
+  const idx = s.indexOf('#');
+  if (idx < 0) return { url: s, args: {} };
+  return { url: s.slice(0, idx), args: parseArgs(s) };
+}
+
+function parseHeaderObject(raw) {
+  if (!raw) return {};
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  try {
+    const obj = JSON.parse(String(raw));
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function getHeaderValue(headers, name) {
+  if (!headers) return '';
+  try {
+    if (typeof headers.get === 'function') return headers.get(name) || '';
+  } catch (_) {}
+  const lower = String(name).toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lower) {
+      const v = headers[key];
+      return Array.isArray(v) ? v.join(', ') : String(v || '');
+    }
+  }
+  return '';
+}
+
+function parseList(v) {
+  if (Array.isArray(v)) return v.map(String).map((s) => s.trim()).filter(Boolean);
+  const s = String(v || '').trim();
+  if (!s) return [];
+  if (s[0] === '[') {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) return arr.map(String).map((x) => x.trim()).filter(Boolean);
+    } catch (_) {}
+  }
+  return s.split(/[\n,|]+/).map((x) => x.trim()).filter(Boolean);
+}
+
+function firstNonEmpty() {
+  for (let i = 0; i < arguments.length; i += 1) {
+    const v = arguments[i];
+    if (v != null && String(v).trim() !== '') return v;
+  }
+  return '';
+}
+
+function bool(v, def) {
+  if (v == null || v === '') return !!def;
+  const s = String(v).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on', 'y'].includes(s);
+}
+
+function clampInt(v, def, min, max) {
+  const n = parseInt(v, 10);
+  const x = Number.isFinite(n) ? n : def;
+  return Math.min(max, Math.max(min, x));
+}
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function finiteOrZero(v) {
+  return Number.isFinite(v) ? v : 0;
+}
+
+function clamp(n, min, max) {
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, n));
+}
+
+function startOfDay(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function addDays(d, days) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + days);
+  return x;
+}
+
+function daysInMonth(year, month) {
+  return new Date(year, month + 1, 0).getDate();
+}
+
+function refreshISO(minutes) {
+  return new Date(Date.now() + minutes * 60000).toISOString();
+}
+
+function fmtMD(d) {
+  return pad2(d.getMonth() + 1) + '/' + pad2(d.getDate());
+}
+
+function fmtDate(d) {
+  return fmtMD(d) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+function fmtClock(ms) {
+  const d = new Date(ms);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+function humanDuration(ms) {
+  if (!Number.isFinite(ms)) return '未知';
+  if (ms <= 0) return '已到期';
+  let total = Math.floor(ms / 1000);
+  const days = Math.floor(total / 86400);
+  total %= 86400;
+  const hours = Math.floor(total / 3600);
+  total %= 3600;
+  const minutes = Math.floor(total / 60);
+  if (days > 0) return days + '天' + (hours > 0 ? hours + '小时' : '');
+  if (hours > 0) return hours + '小时' + (minutes > 0 ? minutes + '分钟' : '');
+  return minutes + '分钟';
+}
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '未知';
+  if (bytes < 0) bytes = 0;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let u = 0;
+  while (bytes >= 1024 && u < units.length - 1) {
+    bytes /= 1024;
+    u += 1;
+  }
+  const digits = bytes >= 100 ? 0 : bytes >= 10 ? 1 : 2;
+  return bytes.toFixed(digits) + ' ' + units[u];
+}
+
+function safeDecode(s) {
+  try {
+    return decodeURIComponent(String(s).replace(/\+/g, '%20'));
+  } catch (_) {
+    return String(s);
+  }
+}
+
+function shortError(err) {
+  const msg = err && err.message ? err.message : String(err || '未知错误');
+  if (/JSON 解析失败/.test(msg)) return '返回内容不是 JSON';
+  if (/HTTP 401/.test(msg) || /HTTP 403/.test(msg)) return '接口拒绝访问';
+  if (/HTTP 404/.test(msg)) return '接口不存在';
+  if (/timeout|timed out/i.test(msg)) return '请求超时';
+  return preview(msg, 80);
+}
+
+function preview(s, len) {
+  s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  if (!len) len = 80;
+  return s.length > len ? s.slice(0, len - 1) + '…' : s;
+}
+
+function text(value, size, weight, color, extra) {
+  const node = {
+    type: 'text',
+    text: value == null ? '' : String(value),
+    font: { size: size || 'body', weight: weight || 'regular' },
+    textColor: color || '#FFFFFF',
+    maxLines: extra && extra.maxLines != null ? extra.maxLines : 1,
+    minScale: extra && extra.minScale != null ? extra.minScale : 0.7,
+  };
+  if (extra && extra.textAlign) node.textAlign = extra.textAlign;
+  if (extra && extra.flex != null) node.flex = extra.flex;
+  return node;
+}
+
+function writeCache(ctx, cfg, payload) {
+  if (!cfg.useCache || !ctx.storage || !ctx.storage.setJSON) return;
+  try {
+    ctx.storage.setJSON(cfg.cacheKey, payload);
+  } catch (_) {}
+}
+
+function readCache(ctx, cfg) {
+  if (!cfg.useCache || !ctx.storage || !ctx.storage.getJSON) return null;
+  try {
+    return ctx.storage.getJSON(cfg.cacheKey);
+  } catch (_) {
+    return null;
+  }
+}
