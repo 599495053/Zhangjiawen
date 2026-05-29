@@ -9,11 +9,10 @@
  * http-request https://emos.club/api/user script-path=emos.Loon.js
  * 
  * 环境变量设置：
- * emos_tokens = "token1
-token2
-token3"  (多账号，换行、逗号、| 分隔)
+ * 在 Loon 配置文件中 [General] 部分添加：
+ * emos_tokens = token1,token2,token3  (多账号，逗号分隔)
  * 或
- * emos_token = "your_token"  (单账号)
+ * emos_token = your_token  (单账号)
  */
 
 
@@ -57,15 +56,17 @@ function parseTokens(value) {
   return unique(raw.split(/[\n,|，]+/));
 }
 
-function getTokens(env) {
-  env = env || {};
+function getTokens() {
   let tokens = [];
 
+  // 从 Loon 的 $persistentStore 读取环境变量
   for (const key of CONFIG.TOKENS_KEYS) {
-    tokens = tokens.concat(parseTokens(env[key]));
+    const val = $persistentStore.read(key) || $persistentStore.read(key.toLowerCase());
+    tokens = tokens.concat(parseTokens(val));
   }
   for (const key of CONFIG.TOKEN_KEYS) {
-    tokens = tokens.concat(parseTokens(env[key]));
+    const val = $persistentStore.read(key) || $persistentStore.read(key.toLowerCase());
+    tokens = tokens.concat(parseTokens(val));
   }
   tokens = tokens.concat(parseTokens(CONFIG.TOKEN));
   tokens = tokens.concat(CONFIG.TOKENS || []);
@@ -221,7 +222,7 @@ async function checkinOne(token, index) {
 
 // 主执行函数
 (function main() {
-  const tokens = getTokens($environment);
+  const tokens = getTokens();
   if (!tokens.length) {
     notify("EMOS 签到", "缺少 token", "请在 Loon 中设置环境变量 emos_tokens；多账号可用换行、英文逗号或 | 分隔。token 是网页 localStorage 里的 activeToken，不要带 Bearer 前缀。");
     return;
@@ -249,4 +250,3 @@ async function checkinOne(token, index) {
     $done();
   })();
 })();
-
