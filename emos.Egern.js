@@ -241,4 +241,3 @@ export default async function(ctx) {
   const failed = results.length - success;
   notify(ctx, "EMOS 多账号签到", "成功 " + success + " / " + results.length + (failed ? "，失败 " + failed : ""), results.map((r) => r.line).join("\n"));
 }
-
