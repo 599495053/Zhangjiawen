@@ -8,8 +8,6 @@ env_schema:
     name: "签到时间"
     description: "cron 表达式，格式：分 时 日 月 星期（如 0 8 * * * 表示每天8点）"
     default_value: "0 1 0 * * ?"
-
-env_schema:
   ACCOUNTS:
     name: "账号列表"
     description: |
