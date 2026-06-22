@@ -1,0 +1,43 @@
+name: "EMOS 签到"
+description: "EMOS 社区自动签到，支持多账号、开关选项、自定义签到文本"
+author: "zjw"
+icon: https://raw.githubusercontent.com/599495053/tubiaoku/main/icon/emos.png
+
+env_schema:
+  CRON:
+    name: "签到时间"
+    description: "自定义 cron 表达式，格式：分 时 日 月 星期（如 0 8 * * * 表示每天8点）"
+    default_value: "0 8 * * *"
+  ACCOUNTS:
+    name: "账号列表"
+    description: |
+      每行一个账号，格式：token 或 token|名称 或 token|名称|签到文本
+      示例：
+      abc123|主账号|早上好
+      def456|小号
+      ghi789
+    default_value: ""
+  SIGN_CONTENT:
+    name: "全局签到文本"
+    description: "所有账号的默认签到附加文本（单个账号可在上方用 | 分隔单独设置）"
+    default_value: ""
+  NOTIFY:
+    name: "发送通知"
+    options:
+      - "true"
+      - "false"
+    default_value: "true"
+  SHOW_INFO:
+    name: "显示详细信息"
+    description: "通知中显示胡萝卜数、连续签到天数等"
+    options:
+      - "true"
+      - "false"
+    default_value: "true"
+
+scriptings:
+  - schedule:
+      name: "EMOS 签到"
+      cron: "0 8 * * *"
+      script_url: https://raw.githubusercontent.com/599495053/Zhangjiawen/refs/heads/main/emos-checkin.js
+      timeout: 120
