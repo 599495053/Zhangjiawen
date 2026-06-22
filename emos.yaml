@@ -39,5 +39,5 @@ scriptings:
   - schedule:
       name: "EMOS 签到"
       cron: "0 8 * * *"
-      script_url: https://raw.githubusercontent.com/599495053/Zhangjiawen/refs/heads/main/emos-checkin.js
+      script_url: https://raw.githubusercontent.com/599495053/Zhangjiawen/refs/heads/main/emos-qd.js
       timeout: 120
