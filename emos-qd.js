@@ -1,5 +1,5 @@
 /**
- * EMOS 签到脚本 v2.0
+ * EMOS 签到脚本 v2.2
  * 配合 module.yaml 使用，所有配置通过 ctx.env 传入
  */
 
@@ -22,7 +22,6 @@ function maskToken(token) {
 function trim(s) { return String(s || "").replace(/^\s+|\s+$/g, ""); }
 
 // ═══════════════════════ 解析账号列表 ═══════════════════════
-// 每行格式：token 或 token|名称 或 token|名称|签到文本
 
 function parseAccounts(env) {
   var raw = trim(env.ACCOUNTS || "");
@@ -81,7 +80,7 @@ async function request(ctx, method, path, token, query, body) {
     Authorization: "Bearer " + token,
     Origin: BASE_URL,
     Referer: BASE_URL + "/",
-    "User-Agent": "Mozilla/5.0 EMOS-Egern-Module/2.0",
+    "User-Agent": "Mozilla/5.0 EMOS-Egern-Module/2.2",
   };
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
@@ -207,7 +206,6 @@ function notify(ctx, title, subtitle, body) {
 
 export default async function(ctx) {
   var env = (ctx && ctx.env) || {};
-
   var accounts = parseAccounts(env);
   var globalSignContent = trim(env.SIGN_CONTENT || "");
   var shouldNotify = parseBool(env.NOTIFY, true);
